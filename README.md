@@ -13,6 +13,10 @@
 </p>
 
 ---
+## Special release
+
+* This version supports HDR displays
+
 
 ## Features
 

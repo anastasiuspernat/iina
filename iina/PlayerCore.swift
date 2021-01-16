@@ -110,6 +110,9 @@ class PlayerCore: NSObject {
   var miniPlayer: MiniPlayerWindowController!
 
   var mpv: MPVController!
+  
+  // HDR
+  var hdrMetadata: (primaries: String?, transfer: String?);
 
   lazy var ffmpegController: FFmpegController = {
     let controller = FFmpegController()
@@ -134,6 +137,10 @@ class PlayerCore: NSObject {
   // test seeking
   var triedUsingExactSeekForCurrentFile: Bool = false
   var useExactSeekForCurrentFile: Bool = true
+  
+  var isPlaylistVisible: Bool {
+    isInMiniPlayer ? miniPlayer.isPlaylistVisible : mainWindow.sideBarStatus == .playlist
+  }
 
   static var keyBindings: [String: KeyMapping] = [:]
 
@@ -234,6 +241,29 @@ class PlayerCore: NSObject {
     }
   }
 
+  // HDR
+  private func importFileColorSpace( path: String )
+  {
+    guard let colorspaceData = FFmpegController.getColorSpaceMetadata(forFile: path) else { return }
+
+    var result: (primaries: String?, transfer: String?)
+    colorspaceData.forEach { (k, v) in
+      guard let key = k as? String else { return }
+      switch key.lowercased() {
+      case "primaries":
+        result.primaries = v as? String
+      case "color-trc":
+        result.transfer = v as? String
+      default:
+        break
+      }
+    }
+    
+    self.hdrMetadata = result
+
+    Logger.log("Received color space metadata for HDR activation: \(result)")
+  }
+
 
   private func openMainWindow(path: String, url: URL, isNetwork: Bool) {
     Logger.log("Opening \(path) in main window", subsystem: subsystem)
@@ -241,6 +271,9 @@ class PlayerCore: NSObject {
     // clear currentFolder since playlist is cleared, so need to auto-load again in playerCore#fileStarted
     info.currentFolder = nil
     info.isNetworkResource = isNetwork
+    
+    // HDR
+    self.importFileColorSpace(path: path)
 
     let isFirstLoad = !mainWindow.loaded
     let _ = mainWindow.window
@@ -518,19 +551,44 @@ class PlayerCore: NSObject {
 
   func screenshot() {
     guard let vid = info.vid, vid > 0 else { return }
+    let saveToFile = Preference.bool(for: .screenshotSaveToFile)
+    let saveToClipboard = Preference.bool(for: .screenshotCopyToClipboard)
+    guard saveToFile || saveToClipboard else { return }
+
     let option = Preference.bool(for: .screenshotIncludeSubtitle) ? "subtitles" : "video"
-    var screenshotTaken = false
-    if Preference.bool(for: .screenshotSaveToFile) {
-      mpv.command(.screenshot, args: [option])
-      screenshotTaken = true
+
+    mpv.asyncCommand(.screenshot, args: [option], replyUserdata: MPVController.UserData.screenshot)
+  }
+
+  func screenshotCallback() {
+    let saveToFile = Preference.bool(for: .screenshotSaveToFile)
+    let saveToClipboard = Preference.bool(for: .screenshotCopyToClipboard)
+    guard saveToFile || saveToClipboard else { return }
+
+    guard let imageFolder = mpv.getString(MPVOption.Screenshot.screenshotDirectory) else { return }
+    guard let lastScreenshotURL = Utility.getLatestScreenshot(from: imageFolder) else { return }
+    guard let image = NSImage(contentsOf: lastScreenshotURL) else {
+      self.sendOSD(.screenshot)
+      return
     }
-    if Preference.bool(for: .screenshotCopyToClipboard), let screenshot = mpv.getScreenshot(option) {
+    if saveToClipboard {
       NSPasteboard.general.clearContents()
-      NSPasteboard.general.writeObjects([screenshot])
-      screenshotTaken = true
+      NSPasteboard.general.writeObjects([image])
     }
-    if screenshotTaken {
-      sendOSD(.screenshot)
+    guard Preference.bool(for: .screenshotShowPreview) else {
+      self.sendOSD(.screenshot)
+      return
+    }
+
+    DispatchQueue.main.async {
+      let osdView = ScreenshootOSDView()
+      osdView.setImage(image,
+                       size: image.size.shrink(toSize: NSSize(width: 300, height: 200)),
+                       fileURL: saveToFile ? lastScreenshotURL : nil)
+      self.sendOSD(.screenshot, forcedTimeout: 5, accessoryView: osdView.view, context: osdView)
+      if !saveToFile {
+        try? FileManager.default.removeItem(at: lastScreenshotURL)
+      }
     }
   }
 
@@ -661,6 +719,11 @@ class PlayerCore: NSObject {
 
   func toggleDeinterlace(_ enable: Bool) {
     mpv.setFlag(MPVOption.Video.deinterlace, enable)
+  }
+
+  func toggleHardwareDecoding(_ enable: Bool) {
+    let value = Preference.HardwareDecoderOption(rawValue: Preference.integer(for: .hardwareDecoder))?.mpvString ?? "auto"
+    mpv.setString(MPVOption.Video.hwdec, enable ? value : "no")
   }
 
   enum VideoEqualizerType {
@@ -1012,6 +1075,11 @@ class PlayerCore: NSObject {
       URL(string: path.addingPercentEncoding(withAllowedCharacters: .urlAllowed) ?? path) :
       URL(fileURLWithPath: path)
     info.isNetworkResource = !info.currentURL!.isFileURL
+
+    if #available(OSX 10.13, *), RemoteCommandController.useSystemMediaControl {
+      NowPlayingInfoManager.updateInfo(withTitle: true)
+    }
+
     // Auto load
     backgroundQueueTicket += 1
     let shouldAutoLoadFiles = info.shouldAutoLoadFiles
@@ -1056,8 +1124,7 @@ class PlayerCore: NSObject {
       getPlaylist()
       getChapters()
       clearAbLoop()
-      syncPlayTimeTimer = Timer.scheduledTimer(timeInterval: TimeInterval(AppData.getTimeInterval),
-                                               target: self, selector: #selector(self.syncUITime), userInfo: nil, repeats: true)
+      createSyncUITimer()
       if #available(macOS 10.12.2, *) {
         touchBarSupport.setupTouchBarUI()
       }
@@ -1097,6 +1164,11 @@ class PlayerCore: NSObject {
     Logger.log("Playback restarted", subsystem: subsystem)
     reloadSavedIINAfilters()
     mainWindow.videoView.videoLayer.draw(forced: true)
+
+    if #available(OSX 10.13, *), RemoteCommandController.useSystemMediaControl {
+      NowPlayingInfoManager.updateInfo()
+    }
+
 
     DispatchQueue.main.async {
       Timer.scheduledTimer(timeInterval: TimeInterval(0.2), target: self, selector: #selector(self.reEnableOSDAfterFileLoading), userInfo: nil, repeats: false)
@@ -1180,13 +1252,23 @@ class PlayerCore: NSObject {
     let ontop = mpv.getFlag(MPVOption.Window.ontop)
     if ontop != mainWindow.isOntop {
       DispatchQueue.main.async {
-        self.mainWindow.isOntop = ontop
-        self.mainWindow.setWindowFloatingOnTop(ontop)
+        self.mainWindow.setWindowFloatingOnTop(ontop, updateOnTopStatus: false)
       }
     }
   }
 
   // MARK: - Sync with UI in MainWindow
+
+  func createSyncUITimer() {
+    invalidateTimer()
+    syncPlayTimeTimer = Timer.scheduledTimer(
+      timeInterval: TimeInterval(DurationDisplayTextField.precision >= 2 ? AppData.syncTimePreciseInterval : AppData.syncTimeInterval),
+      target: self,
+      selector: #selector(self.syncUITime),
+      userInfo: nil,
+      repeats: true
+    )
+  }
 
   func notifyMainWindowVideoSizeChanged() {
     mainWindow.adjustFrameByVideoSize()
@@ -1204,15 +1286,11 @@ class PlayerCore: NSObject {
     case muteButton
     case chapterList
     case playlist
+    case playlistLoop
     case additionalInfo
   }
 
   @objc func syncUITime() {
-    if #available(macOS 10.13, *) {
-      if RemoteCommandController.useSystemMediaControl {
-        NowPlayingInfoManager.updateInfo()
-      }
-    }
     if info.isNetworkResource {
       syncUI(.timeAndCache)
     } else {
@@ -1265,11 +1343,9 @@ class PlayerCore: NSObject {
       }
 
     case .playButton:
-      let pause = mpv.getFlag(MPVOption.PlaybackControl.pause)
       DispatchQueue.main.async {
-        self.info.isPaused = pause
-        self.mainWindow.updatePlayButtonState(pause ? .off : .on)
-        self.miniPlayer.updatePlayButtonState(pause ? .off : .on)
+        self.mainWindow.updatePlayButtonState(self.info.isPaused ? .off : .on)
+        self.miniPlayer.updatePlayButtonState(self.info.isPaused ? .off : .on)
         if #available(macOS 10.12.2, *) {
           self.touchBarSupport.updateTouchBarPlayBtn()
         }
@@ -1291,24 +1367,24 @@ class PlayerCore: NSObject {
 
     case .playlist:
       DispatchQueue.main.async {
-        if self.isInMiniPlayer ? self.miniPlayer.isPlaylistVisible : self.mainWindow.sideBarStatus == .playlist {
+        if self.isPlaylistVisible {
           self.mainWindow.playlistView.playlistTableView.reloadData()
         }
       }
 
+    case .playlistLoop:
+      DispatchQueue.main.async {
+        self.mainWindow.playlistView.updateLoopBtnStatus()
+      }
+
     case .additionalInfo:
       DispatchQueue.main.async {
-        let timeString = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
-        if let capacity = PowerSource.getList().filter({ $0.type == "InternalBattery" }).first?.currentCapacity {
-          self.mainWindow.additionalInfoLabel.stringValue = "\(timeString) | \(capacity)%"
-        } else {
-          self.mainWindow.additionalInfoLabel.stringValue = "\(timeString)"
-        }
+        self.mainWindow.updateAdditionalInfo()
       }
     }
   }
 
-  func sendOSD(_ osd: OSDMessage, autoHide: Bool = true, accessoryView: NSView? = nil) {
+  func sendOSD(_ osd: OSDMessage, autoHide: Bool = true, forcedTimeout: Float? = nil, accessoryView: NSView? = nil, context: Any? = nil) {
     guard mainWindow.loaded && Preference.bool(for: .enableOSD) else { return }
     if info.disableOSDForFileLoading {
       guard case .fileStart = osd else {
@@ -1316,7 +1392,11 @@ class PlayerCore: NSObject {
       }
     }
     DispatchQueue.main.async {
-      self.mainWindow.displayOSD(osd, autoHide: autoHide, accessoryView: accessoryView)
+      self.mainWindow.displayOSD(osd,
+                                 autoHide: autoHide,
+                                 forcedTimeout: forcedTimeout,
+                                 accessoryView: accessoryView,
+                                 context: context)
     }
   }
 
@@ -1374,7 +1454,7 @@ class PlayerCore: NSObject {
         }
       } else {
         Logger.log("Request new thumbnails", subsystem: subsystem)
-        ffmpegController.generateThumbnail(forFile: url.path)
+        ffmpegController.generateThumbnail(forFile: url.path, thumbWidth:Int32(Preference.integer(for: .thumbnailWidth)))
       }
     }
   }
@@ -1579,16 +1659,33 @@ class PlayerCore: NSObject {
   }
 
   /**
-   Get video duration and playback progress, then save it to info.
+   Get video duration, playback progress, and metadata, then save it to info.
    It may take some time to run this method, so it should be used in background.
    */
-  func refreshCachedVideoProgress(forVideoPath path: String) {
-    let duration = FFmpegController.probeVideoDuration(forFile: path)
+  func refreshCachedVideoInfo(forVideoPath path: String) {
+    
+    guard let dict = FFmpegController.probeVideoInfo(forFile: path) else { return }
+    
     let progress = Utility.playbackProgressFromWatchLater(path.md5)
-    info.cachedVideoDurationAndProgress[path] = (
-      duration: duration,
+    self.info.cachedVideoDurationAndProgress[path] = (
+      duration: dict["@iina_duration"] as? Double,
       progress: progress?.second
     )
+    var result: (title: String?, album: String?, artist: String?)
+    dict.forEach { (k, v) in
+      guard let key = k as? String else { return }
+      switch key.lowercased() {
+      case "title":
+        result.title = v as? String
+      case "album":
+        result.album = v as? String
+      case "artist":
+        result.artist = v as? String
+      default:
+        break
+      }
+    }
+    self.info.cachedMetadata[path] = result
   }
 
   enum CurrentMediaIsAudioStatus {
@@ -1654,39 +1751,39 @@ extension PlayerCore: FFmpegControllerDelegate {
 
 @available (macOS 10.13, *)
 class NowPlayingInfoManager {
-  static let info = MPNowPlayingInfoCenter.default()
+  static let center = MPNowPlayingInfoCenter.default()
+  static private var info = [String: Any]()
 
-  static func updateInfo() {
-    var nowPlayingInfo = [String: Any]()
+  static func updateInfo(withTitle: Bool = false) {
     let activePlayer = PlayerCore.lastActive
 
-    if activePlayer.currentMediaIsAudio == .isAudio {
-      nowPlayingInfo[MPMediaItemPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
-      let (title, album, artist) = activePlayer.getMusicMetadata()
-      nowPlayingInfo[MPMediaItemPropertyTitle] = title
-      nowPlayingInfo[MPMediaItemPropertyAlbumTitle] = album
-      nowPlayingInfo[MPMediaItemPropertyArtist] = artist
-    } else {
-      nowPlayingInfo[MPMediaItemPropertyMediaType] = MPNowPlayingInfoMediaType.video.rawValue
-      nowPlayingInfo[MPMediaItemPropertyTitle] = activePlayer.getMediaTitle(withExtension: false)
+    if withTitle {
+      if activePlayer.currentMediaIsAudio == .isAudio {
+        info[MPMediaItemPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
+        let (title, album, artist) = activePlayer.getMusicMetadata()
+        info[MPMediaItemPropertyTitle] = title
+        info[MPMediaItemPropertyAlbumTitle] = album
+        info[MPMediaItemPropertyArtist] = artist
+      } else {
+        info[MPMediaItemPropertyMediaType] = MPNowPlayingInfoMediaType.video.rawValue
+        info[MPMediaItemPropertyTitle] = activePlayer.getMediaTitle(withExtension: false)
+      }
     }
 
     let duration = PlayerCore.lastActive.info.videoDuration?.second ?? 0
-    nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = duration
-    nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = activePlayer.info.videoPosition?.second ?? 0
-    nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = activePlayer.info.playSpeed
-    nowPlayingInfo[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1
-    /*
-    nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackQueueCount] = activePlayer.mpv.getInt(MPVProperty.playlistCount)
-    nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackQueueIndex] = activePlayer.mpv.getInt(MPVProperty.playlistPos)
-    nowPlayingInfo[MPNowPlayingInfoPropertyChapterCount] = activePlayer.mpv.getInt(MPVProperty.chapterListCount)
-    nowPlayingInfo[MPNowPlayingInfoPropertyChapterNumber] = activePlayer.mpv.getInt(MPVProperty.chapter)
-    */
-    info.nowPlayingInfo = nowPlayingInfo
+    let time = activePlayer.info.videoPosition?.second ?? 0
+    let speed = activePlayer.info.playSpeed
+
+    info[MPMediaItemPropertyPlaybackDuration] = duration
+    info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = time
+    info[MPNowPlayingInfoPropertyPlaybackRate] = speed
+    info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1
+
+    center.nowPlayingInfo = info
   }
 
   static func updateState(_ state: MPNowPlayingPlaybackState) {
-    info.playbackState = state
+    center.playbackState = state
+    updateInfo()
   }
-
 }

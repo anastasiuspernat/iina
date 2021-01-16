@@ -66,6 +66,7 @@ class VideoView: NSView {
 
     // dragging init
     registerForDraggedTypes([.nsFilenames, .nsURL, .string])
+    
   }
   
   convenience init(frame: CGRect, player: PlayerCore) {
@@ -221,35 +222,97 @@ class VideoView: NSView {
       actualFps = 60;
     }
     player.mpv.setDouble(MPVOption.Video.displayFps, actualFps)
-    
+  
     setICCProfile(displayId)
     currentDisplay = displayId
   }
 
   func setICCProfile(_ displayId: UInt32) {
-    typealias ProfileData = (uuid: CFUUID, profileUrl: URL?)
+        
+    // HDR
+    if player.hdrMetadata.transfer != nil && player.hdrMetadata.primaries != nil {
+      Logger.log("Will activate HDR color space instead of using ICC profile");
 
-    guard let uuid = CGDisplayCreateUUIDFromDisplayID(displayId)?.takeRetainedValue() else { return }
-    var argResult: ProfileData = (uuid, nil)
-    let dataPointer = UnsafeMutablePointer(&argResult)
-
-    ColorSyncIterateDeviceProfiles({ (dict: CFDictionary?, ptr: UnsafeMutableRawPointer?) -> Bool in
-      if let info = dict as? [String: Any], let current = info["DeviceProfileIsCurrent"] as? Int {
-        let deviceID = info["DeviceID"] as! CFUUID
-        let ptr = ptr!.bindMemory(to: ProfileData.self, capacity: 1)
-        let uuid = ptr.pointee.uuid
-
-        if current == 1, deviceID == uuid {
-          let profileURL = info["DeviceProfileURL"] as! URL
-          ptr.pointee.profileUrl = profileURL
-          return false
-        }
+      // HDR
+      if #available(macOS 10.15, *) {
+        self.wantsExtendedDynamicRangeOpenGLSurface = true
+        videoLayer.wantsExtendedDynamicRangeContent = true
       }
-      return true
-    }, dataPointer)
 
-    if let iccProfilePath = argResult.profileUrl?.path, FileManager.default.fileExists(atPath: iccProfilePath) {
-      player.mpv.setString(MPVOption.GPURendererOptions.iccProfile, iccProfilePath)
+      var name = "" as CFString;
+      if (player.hdrMetadata.transfer == "pq" && player.hdrMetadata.primaries == "displayp3")
+      {
+        name = CGColorSpace.displayP3_PQ_EOTF
+      } else
+      if (player.hdrMetadata.transfer == "hlg" && player.hdrMetadata.primaries == "displayp3")
+      {
+        name = CGColorSpace.displayP3_HLG
+      } else
+      if (player.hdrMetadata.primaries == "displayp3")
+      {
+        name = CGColorSpace.displayP3
+      } else
+      // Special case! CGColorSpace.dcip3 will not activate HDR mode so we set it to displayP3 instead
+      if (player.hdrMetadata.transfer == "pq" && player.hdrMetadata.primaries == "dcip3")
+      {
+        name = CGColorSpace.displayP3_PQ_EOTF
+      } else
+      // Special case! CGColorSpace.dcip3 will not activate HDR mode so we set it to displayP3 instead
+      if (player.hdrMetadata.transfer == "hlg" && player.hdrMetadata.primaries == "dcip3")
+      {
+        name = CGColorSpace.displayP3_HLG
+      } else
+      if (player.hdrMetadata.primaries == "dcip3")
+      {
+        name = CGColorSpace.dcip3
+      } else
+      if (player.hdrMetadata.primaries == "srgb")
+      {
+        name = CGColorSpace.extendedSRGB
+      } else
+      if (player.hdrMetadata.transfer == "pq" && player.hdrMetadata.primaries == "bt2020")
+      {
+        name = CGColorSpace.itur_2020_PQ_EOTF
+      } else
+      if (player.hdrMetadata.primaries == "bt2020")
+      {
+        name = CGColorSpace.itur_2020
+      } else
+      {
+        Logger.log("Unknown HDR color space information: transfer=\(player.hdrMetadata.transfer) primaries=\(player.hdrMetadata.primaries)");
+      }
+      
+      if (name != "" as CFString) {
+        videoLayer.colorspace = CGColorSpace(name: name)
+      }
+      // TODO: The correct color space must be taken from VideoInfo here as well
+      player.mpv.setString(MPVOption.GPURendererOptions.targetTrc, player.hdrMetadata.transfer!)
+    } else
+    {
+      typealias ProfileData = (uuid: CFUUID, profileUrl: URL?)
+      guard let uuid = CGDisplayCreateUUIDFromDisplayID(displayId)?.takeRetainedValue() else { return }
+
+      var argResult: ProfileData = (uuid, nil)
+      withUnsafeMutablePointer(to: &argResult) { data in
+        ColorSyncIterateDeviceProfiles({ (dict: CFDictionary?, ptr: UnsafeMutableRawPointer?) -> Bool in
+          if let info = dict as? [String: Any], let current = info["DeviceProfileIsCurrent"] as? Int {
+            let deviceID = info["DeviceID"] as! CFUUID
+            let ptr = ptr!.bindMemory(to: ProfileData.self, capacity: 1)
+            let uuid = ptr.pointee.uuid
+
+            if current == 1, deviceID == uuid {
+              let profileURL = info["DeviceProfileURL"] as! URL
+              ptr.pointee.profileUrl = profileURL
+              return false
+            }
+          }
+          return true
+        }, data)
+      }
+
+      if let iccProfilePath = argResult.profileUrl?.path, FileManager.default.fileExists(atPath: iccProfilePath) {
+        player.mpv.setString(MPVOption.GPURendererOptions.iccProfile, iccProfilePath)
+      }
     }
   }
 }
